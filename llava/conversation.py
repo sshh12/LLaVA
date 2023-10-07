@@ -11,6 +11,7 @@ class SeparatorStyle(Enum):
     MPT = auto()
     PLAIN = auto()
     LLAMA_2 = auto()
+    MISTRAL = auto()
 
 
 @dataclasses.dataclass
@@ -34,12 +35,7 @@ class Conversation:
             messages = self.messages.copy()
             init_role, init_msg = messages[0].copy()
             init_msg = init_msg[0].replace("<image>", "").strip()
-            if "mmtag" in self.version:
-                messages[0] = (init_role, init_msg)
-                messages.insert(0, (self.roles[0], "<Image><image></Image>"))
-                messages.insert(1, (self.roles[1], "Received."))
-            else:
-                messages[0] = (init_role, "<image>\n" + init_msg)
+            messages[0] = (init_role, "<image>\n" + init_msg)
 
         if self.sep_style == SeparatorStyle.SINGLE:
             ret = self.system + self.sep
@@ -91,6 +87,25 @@ class Conversation:
                 else:
                     ret += ""
             ret = ret.lstrip(self.sep)
+        elif self.sep_style == SeparatorStyle.MISTRAL:
+            wrap_inst = lambda msg: f"[INST] {msg} [/INST]"
+            ret = ""
+
+            for i, (role, message) in enumerate(messages):
+                if i == 0:
+                    assert message, "first message should not be none"
+                    assert role == self.roles[0], "first message should come from user"
+                if message:
+                    if type(message) is tuple:
+                        message, _, _ = message
+                    if i % 2 == 0:
+                        message = wrap_inst(message)
+                        ret += self.sep + message
+                    else:
+                        ret += " " + message + " " + self.sep2
+                else:
+                    ret += ""
+            ret = ret.lstrip(self.sep)
         elif self.sep_style == SeparatorStyle.PLAIN:
             seps = [self.sep, self.sep2]
             ret = self.system
@@ -103,6 +118,9 @@ class Conversation:
                     ret += ""
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
+
+        print(ret)
+        assert False
 
         return ret
 
@@ -308,13 +326,13 @@ conv_llava_llama_2 = Conversation(
     sep2="</s>",
 )
 
-conv_gym = Conversation(
-    system="You are an expert language and vision assistant. You are able to deeply analyze screenshots and provide optimal actions to win video games.",
+conv_mistral_gym = Conversation(
+    system="",
     roles=("USER", "ASSISTANT"),
     version="llama_v2",
     messages=(),
     offset=0,
-    sep_style=SeparatorStyle.LLAMA_2,
+    sep_style=SeparatorStyle.MISTRAL,
     sep="<s>",
     sep2="</s>",
 )
@@ -400,7 +418,7 @@ conv_templates = {
     "llava_v1": conv_llava_v1,
     "v1_mmtag": conv_llava_v1_mmtag,
     "llava_llama_2": conv_llava_llama_2,
-    "gym": conv_gym,
+    "mistral_gym": conv_mistral_gym,
     "mpt": conv_mpt,
 }
 

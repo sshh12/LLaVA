@@ -183,11 +183,9 @@ class ModelWorker:
                 else:
                     images = images.to(self.model.device, dtype=torch.float16)
 
-                replace_token = DEFAULT_IMAGE_TOKEN
-                prompt = prompt.replace(DEFAULT_IMAGE_TOKEN, replace_token)
-
                 num_image_tokens = (
-                    prompt.count(replace_token) * model.get_vision_tower().num_patches
+                    prompt.count(DEFAULT_IMAGE_TOKEN)
+                    * model.get_vision_tower().num_patches
                 )
             else:
                 images = None

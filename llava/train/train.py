@@ -329,15 +329,6 @@ def preprocess_multimodal(sources: Sequence[str], data_args: DataArguments) -> D
                 )
                 sentence["value"] = DEFAULT_IMAGE_TOKEN + "\n" + sentence["value"]
                 sentence["value"] = sentence["value"].strip()
-                if "mmtag" in conversation_lib.default_conversation.version:
-                    sentence["value"] = sentence["value"].replace(
-                        DEFAULT_IMAGE_TOKEN,
-                        "<Image>" + DEFAULT_IMAGE_TOKEN + "</Image>",
-                    )
-            replace_token = DEFAULT_IMAGE_TOKEN
-            sentence["value"] = sentence["value"].replace(
-                DEFAULT_IMAGE_TOKEN, replace_token
-            )
 
     return sources
 
@@ -979,6 +970,8 @@ def train():
                         module = module.to(torch.bfloat16)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+
+    rank0_print(model)
     trainer = LLaVATrainer(
         model=model, tokenizer=tokenizer, args=training_args, **data_module
     )
