@@ -16,7 +16,6 @@
 from abc import ABC, abstractmethod
 
 import torch
-import torch.nn as nn
 
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
@@ -24,9 +23,6 @@ from .multimodal_projector.builder import build_vision_projector
 from llava.constants import (
     IGNORE_INDEX,
     IMAGE_TOKEN_INDEX,
-    DEFAULT_IMAGE_PATCH_TOKEN,
-    DEFAULT_IM_START_TOKEN,
-    DEFAULT_IM_END_TOKEN,
 )
 
 
@@ -60,9 +56,7 @@ class LlavaMetaModel:
             self.vision_tower = vision_tower
 
         self.config.use_mm_proj = True
-        self.config.mm_projector_type = getattr(
-            model_args, "mm_projector_type", "linear"
-        )
+        self.config.mm_projector_type = model_args.mm_projector_type
         self.config.mm_hidden_size = vision_tower.hidden_size
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
@@ -159,74 +153,28 @@ class LlavaMetaForCausalLM(ABC):
             while image_token_indices.numel() > 0:
                 cur_image_features = image_features[cur_image_idx]
                 image_token_start = image_token_indices[0]
-                if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(
-                    self.config, "mm_use_im_start_end", False
-                ):
-                    cur_new_input_embeds.append(
-                        self.get_model()
-                        .embed_tokens(cur_input_ids[: image_token_start - 1])
-                        .detach()
-                    )
-                    cur_new_input_embeds.append(
-                        self.get_model().embed_tokens(
-                            cur_input_ids[image_token_start - 1 : image_token_start]
+                cur_new_input_embeds.append(
+                    self.get_model().embed_tokens(cur_input_ids[:image_token_start])
+                )
+                cur_new_input_embeds.append(cur_image_features)
+                if labels is not None:
+                    cur_new_labels.append(cur_labels[:image_token_start])
+                    cur_new_labels.append(
+                        torch.full(
+                            (cur_image_features.shape[0],),
+                            IGNORE_INDEX,
+                            device=labels.device,
+                            dtype=labels.dtype,
                         )
                     )
-                    cur_new_input_embeds.append(cur_image_features)
-                    cur_new_input_embeds.append(
-                        self.get_model().embed_tokens(
-                            cur_input_ids[image_token_start + 1 : image_token_start + 2]
-                        )
-                    )
-                    if labels is not None:
-                        cur_new_labels.append(cur_labels[:image_token_start])
-                        cur_new_labels.append(
-                            torch.full(
-                                (cur_image_features.shape[0],),
-                                IGNORE_INDEX,
-                                device=labels.device,
-                                dtype=labels.dtype,
-                            )
-                        )
-                        cur_new_labels.append(
-                            cur_labels[image_token_start : image_token_start + 1]
-                        )
-                        cur_labels = cur_labels[image_token_start + 2 :]
-                else:
-                    cur_new_input_embeds.append(
-                        self.get_model().embed_tokens(cur_input_ids[:image_token_start])
-                    )
-                    cur_new_input_embeds.append(cur_image_features)
-                    if labels is not None:
-                        cur_new_labels.append(cur_labels[:image_token_start])
-                        cur_new_labels.append(
-                            torch.full(
-                                (cur_image_features.shape[0],),
-                                IGNORE_INDEX,
-                                device=labels.device,
-                                dtype=labels.dtype,
-                            )
-                        )
-                        cur_labels = cur_labels[image_token_start + 1 :]
+                    cur_labels = cur_labels[image_token_start + 1 :]
                 cur_image_idx += 1
-                if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(
-                    self.config, "mm_use_im_start_end", False
-                ):
-                    cur_input_ids = cur_input_ids[image_token_start + 2 :]
-                else:
-                    cur_input_ids = cur_input_ids[image_token_start + 1 :]
+                cur_input_ids = cur_input_ids[image_token_start + 1 :]
                 image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
             if cur_input_ids.numel() > 0:
-                if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(
-                    self.config, "mm_use_im_start_end", False
-                ):
-                    cur_new_input_embeds.append(
-                        self.get_model().embed_tokens(cur_input_ids).detach()
-                    )
-                else:
-                    cur_new_input_embeds.append(
-                        self.get_model().embed_tokens(cur_input_ids)
-                    )
+                cur_new_input_embeds.append(
+                    self.get_model().embed_tokens(cur_input_ids)
+                )
                 if labels is not None:
                     cur_new_labels.append(cur_labels)
             cur_new_input_embeds = [
@@ -327,55 +275,4 @@ class LlavaMetaForCausalLM(ABC):
         return None, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
-        if model_args.mm_use_im_patch_token:
-            tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
-            self.resize_token_embeddings(len(tokenizer))
-
-        if model_args.mm_use_im_start_end:
-            num_new_tokens = tokenizer.add_tokens(
-                [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
-            )
-            self.resize_token_embeddings(len(tokenizer))
-
-            if num_new_tokens > 0:
-                input_embeddings = self.get_input_embeddings().weight.data
-                output_embeddings = self.get_output_embeddings().weight.data
-
-                input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(
-                    dim=0, keepdim=True
-                )
-                output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(
-                    dim=0, keepdim=True
-                )
-
-                input_embeddings[-num_new_tokens:] = input_embeddings_avg
-                output_embeddings[-num_new_tokens:] = output_embeddings_avg
-
-            if model_args.tune_mm_mlp_adapter:
-                for p in self.get_input_embeddings().parameters():
-                    p.requires_grad = True
-                for p in self.get_output_embeddings().parameters():
-                    p.requires_grad = False
-
-            if model_args.pretrain_mm_mlp_adapter:
-                mm_projector_weights = torch.load(
-                    model_args.pretrain_mm_mlp_adapter, map_location="cpu"
-                )
-                embed_tokens_weight = mm_projector_weights["model.embed_tokens.weight"]
-                assert num_new_tokens == 2
-                if input_embeddings.shape == embed_tokens_weight.shape:
-                    input_embeddings[-num_new_tokens:] = embed_tokens_weight[
-                        -num_new_tokens:
-                    ]
-                elif embed_tokens_weight.shape[0] == num_new_tokens:
-                    input_embeddings[-num_new_tokens:] = embed_tokens_weight
-                else:
-                    raise ValueError(
-                        f"Unexpected embed_tokens_weight shape. Pretrained: {embed_tokens_weight.shape}. Current: {input_embeddings.shape}. Numer of new tokens: {num_new_tokens}."
-                    )
-        elif model_args.mm_use_im_patch_token:
-            if model_args.tune_mm_mlp_adapter:
-                for p in self.get_input_embeddings().parameters():
-                    p.requires_grad = False
-                for p in self.get_output_embeddings().parameters():
-                    p.requires_grad = False
+        pass

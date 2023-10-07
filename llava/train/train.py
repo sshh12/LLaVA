@@ -28,10 +28,7 @@ import transformers
 
 from llava.constants import (
     IGNORE_INDEX,
-    IMAGE_TOKEN_INDEX,
     DEFAULT_IMAGE_TOKEN,
-    DEFAULT_IM_START_TOKEN,
-    DEFAULT_IM_END_TOKEN,
 )
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
@@ -63,8 +60,6 @@ class ModelArguments:
     )  # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
     mm_projector_type: Optional[str] = field(default="linear")
-    mm_use_im_start_end: bool = field(default=False)
-    mm_use_im_patch_token: bool = field(default=True)
     mm_vision_select_feature: Optional[str] = field(default="patch")
 
 
@@ -106,7 +101,6 @@ class TrainingArguments(transformers.TrainingArguments):
         },
     )
     bits: int = field(default=16, metadata={"help": "How many bits to use."})
-    lora_enable: bool = False
     lora_r: int = 64
     lora_alpha: int = 16
     lora_dropout: float = 0.05
@@ -341,10 +335,6 @@ def preprocess_multimodal(sources: Sequence[str], data_args: DataArguments) -> D
                         "<Image>" + DEFAULT_IMAGE_TOKEN + "</Image>",
                     )
             replace_token = DEFAULT_IMAGE_TOKEN
-            if data_args.mm_use_im_start_end:
-                replace_token = (
-                    DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
-                )
             sentence["value"] = sentence["value"].replace(
                 DEFAULT_IMAGE_TOKEN, replace_token
             )
@@ -875,30 +865,11 @@ def train():
             )
         )
 
-    if model_args.vision_tower is not None:
-        if "mpt" in model_args.model_name_or_path:
-            config = transformers.AutoConfig.from_pretrained(
-                model_args.model_name_or_path, trust_remote_code=True
-            )
-            config.attn_config["attn_impl"] = training_args.mpt_attn_impl
-            model = LlavaMPTForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
-                config=config,
-                cache_dir=training_args.cache_dir,
-                **bnb_model_from_pretrained_args,
-            )
-        else:
-            model = LlavaLlamaForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
-                cache_dir=training_args.cache_dir,
-                **bnb_model_from_pretrained_args,
-            )
-    else:
-        model = transformers.LlamaForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            **bnb_model_from_pretrained_args,
-        )
+    model = LlavaLlamaForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir,
+        **bnb_model_from_pretrained_args,
+    )
     model.config.use_cache = False
 
     if model_args.freeze_backbone:
@@ -926,102 +897,72 @@ def train():
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    if training_args.lora_enable:
-        from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, get_peft_model
 
-        lora_config = LoraConfig(
-            r=training_args.lora_r,
-            lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
-            lora_dropout=training_args.lora_dropout,
-            bias=training_args.lora_bias,
-            task_type="CAUSAL_LM",
+    lora_config = LoraConfig(
+        r=training_args.lora_r,
+        lora_alpha=training_args.lora_alpha,
+        target_modules=find_all_linear_names(model),
+        lora_dropout=training_args.lora_dropout,
+        bias=training_args.lora_bias,
+        task_type="CAUSAL_LM",
+    )
+    if training_args.bits == 16:
+        if training_args.bf16:
+            model.to(torch.bfloat16)
+        if training_args.fp16:
+            model.to(torch.float16)
+    rank0_print("Adding LoRA adapters...")
+    model = get_peft_model(model, lora_config)
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir,
+        model_max_length=training_args.model_max_length,
+        padding_side="right",
+        use_fast=False,
+    )
+
+    tokenizer.pad_token = tokenizer.unk_token
+    conversation_lib.default_conversation = conversation_lib.conv_templates[
+        model_args.version
+    ]
+
+    model.get_model().initialize_vision_modules(
+        model_args=model_args, fsdp=training_args.fsdp
+    )
+
+    vision_tower = model.get_vision_tower()
+    vision_tower.to(
+        dtype=torch.bfloat16 if training_args.bf16 else torch.float16,
+        device=training_args.device,
+    )
+
+    data_args.image_processor = vision_tower.image_processor
+    data_args.is_multimodal = True
+
+    model.config.image_aspect_ratio = data_args.image_aspect_ratio
+    model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
+
+    model.config.tune_mm_mlp_adapter = (
+        training_args.tune_mm_mlp_adapter
+    ) = model_args.tune_mm_mlp_adapter
+    if model_args.tune_mm_mlp_adapter:
+        model.requires_grad_(False)
+        for p in model.get_model().mm_projector.parameters():
+            p.requires_grad = True
+
+    model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
+    if training_args.freeze_mm_mlp_adapter:
+        for p in model.get_model().mm_projector.parameters():
+            p.requires_grad = False
+
+    if training_args.bits in [4, 8]:
+        model.get_model().mm_projector.to(
+            dtype=compute_dtype, device=training_args.device
         )
-        if training_args.bits == 16:
-            if training_args.bf16:
-                model.to(torch.bfloat16)
-            if training_args.fp16:
-                model.to(torch.float16)
-        rank0_print("Adding LoRA adapters...")
-        model = get_peft_model(model, lora_config)
 
-    if "mpt" in model_args.model_name_or_path:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-        )
-    else:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=False,
-        )
-
-    if model_args.version == "v0":
-        if tokenizer.pad_token is None:
-            smart_tokenizer_and_embedding_resize(
-                special_tokens_dict=dict(pad_token="[PAD]"),
-                tokenizer=tokenizer,
-                model=model,
-            )
-    elif model_args.version == "v0.5":
-        tokenizer.pad_token = tokenizer.unk_token
-    else:
-        tokenizer.pad_token = tokenizer.unk_token
-        if model_args.version in conversation_lib.conv_templates:
-            conversation_lib.default_conversation = conversation_lib.conv_templates[
-                model_args.version
-            ]
-        else:
-            conversation_lib.default_conversation = conversation_lib.conv_templates[
-                "vicuna_v1"
-            ]
-
-    if model_args.vision_tower is not None:
-        model.get_model().initialize_vision_modules(
-            model_args=model_args, fsdp=training_args.fsdp
-        )
-
-        vision_tower = model.get_vision_tower()
-        vision_tower.to(
-            dtype=torch.bfloat16 if training_args.bf16 else torch.float16,
-            device=training_args.device,
-        )
-
-        data_args.image_processor = vision_tower.image_processor
-        data_args.is_multimodal = True
-
-        model.config.image_aspect_ratio = data_args.image_aspect_ratio
-        model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
-
-        model.config.tune_mm_mlp_adapter = (
-            training_args.tune_mm_mlp_adapter
-        ) = model_args.tune_mm_mlp_adapter
-        if model_args.tune_mm_mlp_adapter:
-            model.requires_grad_(False)
-            for p in model.get_model().mm_projector.parameters():
-                p.requires_grad = True
-
-        model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
-        if training_args.freeze_mm_mlp_adapter:
-            for p in model.get_model().mm_projector.parameters():
-                p.requires_grad = False
-
-        if training_args.bits in [4, 8]:
-            model.get_model().mm_projector.to(
-                dtype=compute_dtype, device=training_args.device
-            )
-
-        model.config.mm_use_im_start_end = (
-            data_args.mm_use_im_start_end
-        ) = model_args.mm_use_im_start_end
-        training_args.use_im_start_end = model_args.mm_use_im_start_end
-        model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
-        model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+    model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
@@ -1050,23 +991,16 @@ def train():
 
     model.config.use_cache = True
 
-    if training_args.lora_enable:
-        state_dict = get_peft_state_maybe_zero_3(
-            model.named_parameters(), training_args.lora_bias
-        )
-        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
-            model.named_parameters()
-        )
-        if training_args.local_rank == 0 or training_args.local_rank == -1:
-            model.config.save_pretrained(training_args.output_dir)
-            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
-            torch.save(
-                non_lora_state_dict,
-                os.path.join(training_args.output_dir, "non_lora_trainables.bin"),
-            )
-    else:
-        safe_save_model_for_hf_trainer(
-            trainer=trainer, output_dir=training_args.output_dir
+    state_dict = get_peft_state_maybe_zero_3(
+        model.named_parameters(), training_args.lora_bias
+    )
+    non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
+    if training_args.local_rank == 0 or training_args.local_rank == -1:
+        model.config.save_pretrained(training_args.output_dir)
+        model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+        torch.save(
+            non_lora_state_dict,
+            os.path.join(training_args.output_dir, "non_lora_trainables.bin"),
         )
 
 

@@ -308,6 +308,17 @@ conv_llava_llama_2 = Conversation(
     sep2="</s>",
 )
 
+conv_gym = Conversation(
+    system="You are an expert language and vision assistant. You are able to deeply analyze screenshots and provide optimal actions to win video games.",
+    roles=("USER", "ASSISTANT"),
+    version="llama_v2",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.LLAMA_2,
+    sep="<s>",
+    sep2="</s>",
+)
+
 conv_mpt = Conversation(
     system="""<|im_start|>system
 A conversation between a user and an LLM-based AI assistant. The assistant gives helpful and honest answers.""",
@@ -389,6 +400,7 @@ conv_templates = {
     "llava_v1": conv_llava_v1,
     "v1_mmtag": conv_llava_v1_mmtag,
     "llava_llama_2": conv_llava_llama_2,
+    "gym": conv_gym,
     "mpt": conv_mpt,
 }
 
