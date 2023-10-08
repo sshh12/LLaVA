@@ -88,15 +88,22 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):
-        image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
-        return image_features
+    def encode_images(self, frames):
+        batch_size, frame_cnt, c, w, h = frames.shape
+        vision_tower = self.get_vision_tower()
+        vision_tower_features = vision_tower(
+            frames.view(batch_size * frame_cnt, c, w, h)
+        )
+        _, d1, d2 = vision_tower_features.shape
+        frame_projected_features = self.get_model().mm_projector(
+            vision_tower_features.reshape(batch_size, d1, d2 * frame_cnt)
+        )
+        return frame_projected_features
 
     def prepare_inputs_labels_for_multimodal(
-        self, input_ids, attention_mask, past_key_values, labels, images
+        self, input_ids, attention_mask, past_key_values, labels, frames
     ):
-        image_features = self.encode_images(images)
+        image_features = self.encode_images(frames)
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None

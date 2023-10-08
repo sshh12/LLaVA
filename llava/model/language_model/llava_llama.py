@@ -68,7 +68,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        images: Optional[torch.FloatTensor] = None,
+        frames: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = (
@@ -92,7 +92,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             inputs_embeds,
             labels,
         ) = self.prepare_inputs_labels_for_multimodal(
-            input_ids, attention_mask, past_key_values, labels, images
+            input_ids, attention_mask, past_key_values, labels, frames
         )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)

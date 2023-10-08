@@ -54,6 +54,7 @@ class ModelArguments:
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
+    tune_mm_mlp_adapter_without_freezing_backbone: bool = field(default=False)
     vision_tower: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(
         default=-1
@@ -649,32 +650,44 @@ class LazySupervisedDataset(Dataset):
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-
-        image_file = self.list_data_dict[i]["image"]
+        
         image_folder = self.data_args.image_folder
         processor = self.data_args.image_processor
-        image = Image.open(os.path.join(image_folder, image_file)).convert("RGB")
-        if self.data_args.image_aspect_ratio == "pad":
 
-            def expand2square(pil_img, background_color):
-                width, height = pil_img.size
-                if width == height:
-                    return pil_img
-                elif width > height:
-                    result = Image.new(pil_img.mode, (width, width), background_color)
-                    result.paste(pil_img, (0, (width - height) // 2))
-                    return result
-                else:
-                    result = Image.new(pil_img.mode, (height, height), background_color)
-                    result.paste(pil_img, ((height - width) // 2, 0))
-                    return result
+        frames = []
+        for img_fn in self.list_data_dict[i]["frames"]:
+            image = Image.open(os.path.join(image_folder, img_fn)).convert("RGB")
+            if self.data_args.image_aspect_ratio == "pad":
 
-            image = expand2square(
-                image, tuple(int(x * 255) for x in processor.image_mean)
-            )
-            image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
-        else:
-            image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+                def expand2square(pil_img, background_color):
+                    width, height = pil_img.size
+                    if width == height:
+                        return pil_img
+                    elif width > height:
+                        result = Image.new(
+                            pil_img.mode, (width, width), background_color
+                        )
+                        result.paste(pil_img, (0, (width - height) // 2))
+                        return result
+                    else:
+                        result = Image.new(
+                            pil_img.mode, (height, height), background_color
+                        )
+                        result.paste(pil_img, ((height - width) // 2, 0))
+                        return result
+
+                image = expand2square(
+                    image, tuple(int(x * 255) for x in processor.image_mean)
+                )
+                image = processor.preprocess(image, return_tensors="pt")[
+                    "pixel_values"
+                ][0]
+            else:
+                image = processor.preprocess(image, return_tensors="pt")[
+                    "pixel_values"
+                ][0]
+            frames.append(image)
+
         sources = preprocess_multimodal(
             copy.deepcopy([e["conversations"] for e in sources]), self.data_args
         )
@@ -684,21 +697,18 @@ class LazySupervisedDataset(Dataset):
                 input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0]
             )
 
-        # image exist in the data
-        if "image" in self.list_data_dict[i]:
-            data_dict["image"] = image
-        else:
-            raise ValueError(repr(self.list_data_dict[i]))
+        data_dict["frames"] = torch.stack(frames)
         return data_dict
 
 
 @dataclass
-class DataCollatorForSupervisedDataset(object):
+class DataCollatorForSupervisedDataset:
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        self.tokenizer.pad_token_id = 11
         input_ids, labels = tuple(
             [instance[key] for instance in instances] for key in ("input_ids", "labels")
         )
@@ -716,8 +726,8 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-        images = [instance["image"] for instance in instances]
-        batch["images"] = torch.stack(images)
+        frames = [instance["frames"] for instance in instances]
+        batch["frames"] = torch.stack(frames)
 
         return batch
 
@@ -852,7 +862,8 @@ def train():
         training_args.tune_mm_mlp_adapter
     ) = model_args.tune_mm_mlp_adapter
     if model_args.tune_mm_mlp_adapter:
-        model.requires_grad_(False)
+        if not model_args.tune_mm_mlp_adapter_without_freezing_backbone:
+            model.requires_grad_(False)
         for p in model.get_model().mm_projector.parameters():
             p.requires_grad = True
 
