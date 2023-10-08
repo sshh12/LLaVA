@@ -69,7 +69,6 @@ class DataArguments:
         default=None, metadata={"help": "Path to the training data."}
     )
     lazy_preprocess: bool = False
-    is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = "square"
     image_grid_pinpoints: Optional[str] = field(default=None)
@@ -106,7 +105,6 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
-    group_by_modality_length: bool = field(default=False)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -185,48 +183,6 @@ def find_all_linear_names(model):
     if "lm_head" in lora_module_names:  # needed for 16-bit
         lora_module_names.remove("lm_head")
     return list(lora_module_names)
-
-
-def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
-    """Collects the state dict and dump to disk."""
-
-    if getattr(trainer.args, "tune_mm_mlp_adapter", False):
-        # Only save Adapter
-        keys_to_match = ["mm_projector"]
-        if getattr(trainer.args, "use_im_start_end", False):
-            keys_to_match.extend(["embed_tokens", "embed_in"])
-
-        weight_to_save = get_mm_adapter_state_maybe_zero_3(
-            trainer.model.named_parameters(), keys_to_match
-        )
-        trainer.model.config.save_pretrained(output_dir)
-
-        current_folder = output_dir.split("/")[-1]
-        parent_folder = os.path.dirname(output_dir)
-        if trainer.args.local_rank == 0 or trainer.args.local_rank == -1:
-            if current_folder.startswith("checkpoint-"):
-                mm_projector_folder = os.path.join(parent_folder, "mm_projector")
-                os.makedirs(mm_projector_folder, exist_ok=True)
-                torch.save(
-                    weight_to_save,
-                    os.path.join(mm_projector_folder, f"{current_folder}.bin"),
-                )
-            else:
-                torch.save(
-                    weight_to_save, os.path.join(output_dir, f"mm_projector.bin")
-                )
-        return
-
-    if trainer.deepspeed:
-        torch.cuda.synchronize()
-        trainer.save_model(output_dir)
-        return
-
-    state_dict = trainer.model.state_dict()
-    if trainer.args.should_save:
-        cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-        del state_dict
-        trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
 
 def smart_tokenizer_and_embedding_resize(
@@ -317,10 +273,6 @@ def _add_speaker_and_signal(header, source, get_conversation=True):
 
 
 def preprocess_multimodal(sources: Sequence[str], data_args: DataArguments) -> Dict:
-    is_multimodal = data_args.is_multimodal
-    if not is_multimodal:
-        return sources
-
     for source in sources:
         for sentence in source:
             if DEFAULT_IMAGE_TOKEN in sentence["value"]:
@@ -354,23 +306,13 @@ def preprocess_llama_2(
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
-
-    if has_image:
-        input_ids = torch.stack(
-            [
-                tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-                for prompt in conversations
-            ],
-            dim=0,
-        )
-    else:
-        input_ids = tokenizer(
-            conversations,
-            return_tensors="pt",
-            padding="longest",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-        ).input_ids
+    input_ids = torch.stack(
+        [
+            tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+            for prompt in conversations
+        ],
+        dim=0,
+    )
 
     targets = input_ids.clone()
 
@@ -613,7 +555,6 @@ def preprocess_plain(
 def preprocess(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False,
 ) -> Dict:
     """
     Given a list of sources, each is a conversation list. This transform:
@@ -631,9 +572,9 @@ def preprocess(
         conversation_lib.default_conversation.sep_style
         == conversation_lib.SeparatorStyle.LLAMA_2
     ):
-        return preprocess_llama_2(sources, tokenizer, has_image=has_image)
+        return preprocess_llama_2(sources, tokenizer, has_image=True)
     if conversation_lib.default_conversation.version.startswith("v1"):
-        return preprocess_v1(sources, tokenizer, has_image=has_image)
+        return preprocess_v1(sources, tokenizer, has_image=True)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer)
     # add end signal and concatenate together
@@ -647,23 +588,14 @@ def preprocess(
     def get_tokenize_len(prompts):
         return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
 
-    if has_image:
-        input_ids = [
-            tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-            for prompt in conversations
-        ]
-    else:
-        conversations_tokenized = _tokenize_fn(conversations, tokenizer)
-        input_ids = conversations_tokenized["input_ids"]
+    input_ids = [
+        tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+        for prompt in conversations
+    ]
 
     targets = copy.deepcopy(input_ids)
     for target, source in zip(targets, sources):
-        if has_image:
-            tokenized_lens = get_tokenize_len([header] + [s["value"] for s in source])
-        else:
-            tokenized_lens = _tokenize_fn(
-                [header] + [s["value"] for s in source], tokenizer
-            )["input_ids_lens"]
+        tokenized_lens = get_tokenize_len([header] + [s["value"] for s in source])
         speakers = [sentence["from"] for sentence in source]
         _mask_targets(target, tokenized_lens, speakers)
 
@@ -717,48 +649,36 @@ class LazySupervisedDataset(Dataset):
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-        if "image" in sources[0]:
-            image_file = self.list_data_dict[i]["image"]
-            image_folder = self.data_args.image_folder
-            processor = self.data_args.image_processor
-            image = Image.open(os.path.join(image_folder, image_file)).convert("RGB")
-            if self.data_args.image_aspect_ratio == "pad":
 
-                def expand2square(pil_img, background_color):
-                    width, height = pil_img.size
-                    if width == height:
-                        return pil_img
-                    elif width > height:
-                        result = Image.new(
-                            pil_img.mode, (width, width), background_color
-                        )
-                        result.paste(pil_img, (0, (width - height) // 2))
-                        return result
-                    else:
-                        result = Image.new(
-                            pil_img.mode, (height, height), background_color
-                        )
-                        result.paste(pil_img, ((height - width) // 2, 0))
-                        return result
+        image_file = self.list_data_dict[i]["image"]
+        image_folder = self.data_args.image_folder
+        processor = self.data_args.image_processor
+        image = Image.open(os.path.join(image_folder, image_file)).convert("RGB")
+        if self.data_args.image_aspect_ratio == "pad":
 
-                image = expand2square(
-                    image, tuple(int(x * 255) for x in processor.image_mean)
-                )
-                image = processor.preprocess(image, return_tensors="pt")[
-                    "pixel_values"
-                ][0]
-            else:
-                image = processor.preprocess(image, return_tensors="pt")[
-                    "pixel_values"
-                ][0]
-            sources = preprocess_multimodal(
-                copy.deepcopy([e["conversations"] for e in sources]), self.data_args
+            def expand2square(pil_img, background_color):
+                width, height = pil_img.size
+                if width == height:
+                    return pil_img
+                elif width > height:
+                    result = Image.new(pil_img.mode, (width, width), background_color)
+                    result.paste(pil_img, (0, (width - height) // 2))
+                    return result
+                else:
+                    result = Image.new(pil_img.mode, (height, height), background_color)
+                    result.paste(pil_img, ((height - width) // 2, 0))
+                    return result
+
+            image = expand2square(
+                image, tuple(int(x * 255) for x in processor.image_mean)
             )
+            image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
         else:
-            sources = copy.deepcopy([e["conversations"] for e in sources])
-        data_dict = preprocess(
-            sources, self.tokenizer, has_image=("image" in self.list_data_dict[i])
+            image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+        sources = preprocess_multimodal(
+            copy.deepcopy([e["conversations"] for e in sources]), self.data_args
         )
+        data_dict = preprocess(sources, self.tokenizer)
         if isinstance(i, int):
             data_dict = dict(
                 input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0]
@@ -767,10 +687,8 @@ class LazySupervisedDataset(Dataset):
         # image exist in the data
         if "image" in self.list_data_dict[i]:
             data_dict["image"] = image
-        elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
-            crop_size = self.data_args.image_processor.crop_size
-            data_dict["image"] = torch.zeros(3, crop_size["height"], crop_size["width"])
+        else:
+            raise ValueError(repr(self.list_data_dict[i]))
         return data_dict
 
 
@@ -798,12 +716,8 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-        if "image" in instances[0]:
-            images = [instance["image"] for instance in instances]
-            if all(x is not None and x.shape == images[0].shape for x in images):
-                batch["images"] = torch.stack(images)
-            else:
-                batch["images"] = images
+        images = [instance["image"] for instance in instances]
+        batch["images"] = torch.stack(images)
 
         return batch
 
@@ -930,7 +844,6 @@ def train():
     )
 
     data_args.image_processor = vision_tower.image_processor
-    data_args.is_multimodal = True
 
     model.config.image_aspect_ratio = data_args.image_aspect_ratio
     model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
@@ -988,12 +901,19 @@ def train():
         model.named_parameters(), training_args.lora_bias
     )
     non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
+    projector_state_dict = get_mm_adapter_state_maybe_zero_3(
+        model.named_parameters(), ["mm_projector", "vision_resampler"]
+    )
     if training_args.local_rank == 0 or training_args.local_rank == -1:
         model.config.save_pretrained(training_args.output_dir)
         model.save_pretrained(training_args.output_dir, state_dict=state_dict)
         torch.save(
             non_lora_state_dict,
             os.path.join(training_args.output_dir, "non_lora_trainables.bin"),
+        )
+        torch.save(
+            projector_state_dict,
+            os.path.join(training_args.output_dir, f"mm_projector.bin"),
         )
 
 

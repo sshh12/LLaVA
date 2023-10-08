@@ -96,29 +96,7 @@ class LlavaMetaForCausalLM(ABC):
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, attention_mask, past_key_values, labels, images
     ):
-        vision_tower = self.get_vision_tower()
-        if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            if (
-                past_key_values is not None
-                and vision_tower is not None
-                and images is not None
-                and input_ids.shape[1] == 1
-            ):
-                attention_mask = torch.ones(
-                    (attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
-            return input_ids, attention_mask, past_key_values, None, labels
-
-        if type(images) is list or images.ndim == 5:
-            concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
-            split_sizes = [image.shape[0] for image in images]
-            image_features = torch.split(image_features, split_sizes, dim=0)
-            image_features = [x.flatten(0, 1) for x in image_features]
-        else:
-            image_features = self.encode_images(images)
+        image_features = self.encode_images(images)
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None

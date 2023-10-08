@@ -11,7 +11,6 @@ class SeparatorStyle(Enum):
     MPT = auto()
     PLAIN = auto()
     LLAMA_2 = auto()
-    MISTRAL = auto()
 
 
 @dataclasses.dataclass
@@ -87,25 +86,6 @@ class Conversation:
                 else:
                     ret += ""
             ret = ret.lstrip(self.sep)
-        elif self.sep_style == SeparatorStyle.MISTRAL:
-            wrap_inst = lambda msg: f"[INST] {msg} [/INST]"
-            ret = ""
-
-            for i, (role, message) in enumerate(messages):
-                if i == 0:
-                    assert message, "first message should not be none"
-                    assert role == self.roles[0], "first message should come from user"
-                if message:
-                    if type(message) is tuple:
-                        message, _, _ = message
-                    if i % 2 == 0:
-                        message = wrap_inst(message)
-                        ret += self.sep + message
-                    else:
-                        ret += " " + message + " " + self.sep2
-                else:
-                    ret += ""
-            ret = ret.lstrip(self.sep)
         elif self.sep_style == SeparatorStyle.PLAIN:
             seps = [self.sep, self.sep2]
             ret = self.system
@@ -118,9 +98,6 @@ class Conversation:
                     ret += ""
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
-
-        print(ret)
-        assert False
 
         return ret
 
@@ -326,13 +303,13 @@ conv_llava_llama_2 = Conversation(
     sep2="</s>",
 )
 
-conv_mistral_gym = Conversation(
-    system="",
+conv_llava_llama_2_gym = Conversation(
+    system="You are an expert video game player who can choose optimal actions based on just a screenshot.",
     roles=("USER", "ASSISTANT"),
     version="llama_v2",
     messages=(),
     offset=0,
-    sep_style=SeparatorStyle.MISTRAL,
+    sep_style=SeparatorStyle.LLAMA_2,
     sep="<s>",
     sep2="</s>",
 )
@@ -418,7 +395,7 @@ conv_templates = {
     "llava_v1": conv_llava_v1,
     "v1_mmtag": conv_llava_v1_mmtag,
     "llava_llama_2": conv_llava_llama_2,
-    "mistral_gym": conv_mistral_gym,
+    "llava_llama_2_gym": conv_llava_llama_2_gym,
     "mpt": conv_mpt,
 }
 
