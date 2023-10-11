@@ -157,7 +157,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
-                "images": kwargs.get("images", None),
+                "frames": kwargs.get("frames", None),
             }
         )
         return model_inputs
